@@ -1,291 +1,703 @@
-# streamlit_app.py
-# Genstat-style RB ANOVA + Matrix with your alpha toggles and multi-sheet parser
+"""
+STRI Trial Analysis - Streamlit Web App
+Single file version for quick testing
+"""
 
-import io, math, re
-from dataclasses import dataclass
-import numpy as np, pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 from scipy import stats
-import statsmodels.formula.api as smf
-from statsmodels.stats.anova import anova_lm
+from io import BytesIO
+import base64
 
-st.set_page_config(page_title="Genstat-Style Analyzer", layout="wide")
-st.title("Genstat-Style RB ANOVA & Matrix")
+# Page config
+st.set_page_config(
+    page_title="STRI Trial Analysis",
+    page_icon="🌱",
+    layout="wide"
+)
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Controls")
-    alpha_options = {
-        "Fungicide (0.05)": 0.05,
-        "Biologicals in lab (0.10)": 0.10,
-        "Biologicals in field (0.15)": 0.15,
-        "Custom": None,
-    }
-    alpha_label = st.radio("Significance level:", list(alpha_options.keys()))
-    alpha = (
-        st.number_input("Custom alpha", 0.0001, 0.2, 0.05, 0.005, format="%.4f")
-        if alpha_options[alpha_label] is None
-        else alpha_options[alpha_label]
+# Helper functions from your working code
+def parse_sheet_label_to_date(label: str):
+    """Parse sheet label into a date"""
+    for dayfirst in (True, False):
+        dt = pd.to_datetime(label, errors="coerce", dayfirst=dayfirst)
+        if pd.notna(dt):
+            return dt
+    return None
+
+def chronological_labels(labels):
+    """Put labels in chronological order"""
+    pairs = [(lab, parse_sheet_label_to_date(lab)) for lab in labels]
+    pairs_sorted = sorted(
+        pairs, key=lambda x: (pd.isna(x[1]), x[1] if pd.notna(x[1]) else pd.Timestamp.max)
     )
+    return [p[0] for p in pairs_sorted]
 
-    adjust_opts = {"None": "none", "Bonferroni": "bonferroni", "Holm": "holm", "Benjamini–Hochberg (FDR)": "fdr_bh"}
-    adj_method_label = st.selectbox("Multiple testing correction across columns", list(adjust_opts.keys()), index=0)
-    adj_method = adjust_opts[adj_method_label]
+def generate_cld_overlap(means, mse, df_error, alpha, rep_counts, a_is_lowest=True):
+    """Generate compact letter display (CLD) - your working algorithm"""
+    trts = list(means.index)
+    letters = {t: set() for t in trts}
+    nsd = pd.DataFrame(False, index=trts, columns=trts)
+    
+    for t in trts:
+        nsd.loc[t, t] = True
+    
+    t_crit = stats.t.ppf(1 - alpha/2, df_error) if df_error > 0 else np.nan
+    
+    for a, b in combinations(trts, 2):
+        n1, n2 = rep_counts.get(a, 1), rep_counts.get(b, 1)
+        if n1 > 0 and n2 > 0 and pd.notna(mse) and pd.notna(t_crit):
+            lsd_pair = t_crit * np.sqrt(mse * (1/n1 + 1/n2))
+            diff = abs(means[a] - means[b])
+            if diff <= lsd_pair:
+                nsd.loc[a, b] = True
+                nsd.loc[b, a] = True
+    
+    order = means.sort_values(ascending=a_is_lowest).index
+    groups = []
+    next_letter_code = ord("a")
+    
+    for t in order:
+        joined_any = False
+        for g in groups:
+            if all(nsd.loc[t, m] for m in g["members"]):
+                letters[t].add(g["letter"])
+                g["members"].append(t)
+                joined_any = True
+        if not joined_any:
+            new_letter = chr(next_letter_code)
+            groups.append({"letter": new_letter, "members": [t]})
+            letters[t].add(new_letter)
+            next_letter_code += 1
+        
+        # Expand groups if needed
+        changed = True
+        while changed:
+            changed = False
+            for g in groups:
+                for cand in trts:
+                    if g["letter"] not in letters[cand]:
+                        if all(nsd.loc[cand, m] for m in g["members"]):
+                            letters[cand].add(g["letter"])
+                            g["members"].append(cand)
+                            changed = True
+    
+    return {t: "".join(sorted(v)) for t, v in letters.items()}, nsd
 
-    input_mode = st.radio("Excel layout:", ["Single sheet (wide)", "Multi-sheet (each sheet = date)"])
+# Title
+st.title("🌱 STRI Turf Trial Analysis Tool")
+st.markdown("---")
 
-# ---------- Helpers ----------
-def _clean_colnames(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [str(c).strip().replace(" ", "_") for c in out.columns]
-    return out
+# Initialize session state
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+if 'statistics' not in st.session_state:
+    st.session_state.statistics = None
+if 'raw_data' not in st.session_state:
+    st.session_state.raw_data = None
+if 'treatment_map' not in st.session_state:
+    st.session_state.treatment_map = {}
 
-def guess_key_columns(df: pd.DataFrame):
-    def find_one(cands):
-        for c in df.columns:
-            cl = str(c).lower()
-            if any(tag in cl for tag in cands):
-                return c
+# Functions
+def parse_trial_plan(df):
+    """Extract treatment names from Trial Plan sheet"""
+    treatment_map = {}
+    for idx, row in df.iterrows():
+        if pd.notna(row[0]) and isinstance(row[0], str) and '[' in row[0]:
+            text = row[0]
+            if text.startswith('[') and ']' in text:
+                try:
+                    num_str = text.split(']')[0].replace('[', '').strip()
+                    num = int(num_str)
+                    name = text.split(']')[1].strip()
+                    treatment_map[num] = name
+                except:
+                    continue
+    return treatment_map
+
+def parse_assessment_sheet(df, sheet_name, treatment_map):
+    """Parse individual assessment sheet"""
+    # Find header row - look for any variation of column names
+    header_row = None
+    for idx in range(min(10, len(df))):  # Check first 10 rows
+        row_str = ' '.join([str(val) for val in df.iloc[idx].values if pd.notna(val)])
+        if 'Block' in row_str and 'Plot' in row_str and 'Treat' in row_str:
+            header_row = idx
+            break
+    
+    if header_row is None:
+        st.warning(f"Could not find header row in sheet: {sheet_name}")
         return None
-    plot_col = find_one(["plot", "id"]) or "Plot"
-    block_col = find_one(["block", "rep", "replicate"]) or "Block"
-    trt_col = find_one(["treat", "trt"]) or "Treatment"
-    excl = {plot_col, block_col, trt_col}
-    numeric_cols = [c for c in df.columns if c not in excl and pd.api.types.is_numeric_dtype(df[c])]
-    return plot_col, block_col, trt_col, numeric_cols
+    
+    # Get data
+    headers = df.iloc[header_row].values
+    data_rows = df.iloc[header_row + 1:].copy()
+    data_rows.columns = headers
+    
+    # Find the block column (might be 'Block!', 'Block', etc.)
+    block_col = None
+    plot_col = None
+    treat_col = None
+    
+    for col in data_rows.columns:
+        col_str = str(col).lower()
+        if 'block' in col_str:
+            block_col = col
+        elif 'plot' in col_str:
+            plot_col = col
+        elif 'treat' in col_str:
+            treat_col = col
+    
+    if block_col is None or plot_col is None or treat_col is None:
+        st.warning(f"Could not find required columns in sheet: {sheet_name}")
+        return None
+    
+    # Filter valid rows (has block number)
+    data_rows = data_rows[pd.notna(data_rows[block_col])]
+    
+    # Rename columns to standard names
+    rename_dict = {
+        block_col: 'Block',
+        plot_col: 'Plot',
+        treat_col: 'Treatment'
+    }
+    data_rows = data_rows.rename(columns=rename_dict)
+    
+    # Convert Treatment to int if possible
+    try:
+        data_rows['Treatment'] = pd.to_numeric(data_rows['Treatment'], errors='coerce')
+        data_rows = data_rows[pd.notna(data_rows['Treatment'])]
+        data_rows['Treatment'] = data_rows['Treatment'].astype(int)
+    except:
+        st.warning(f"Could not convert Treatment column in sheet: {sheet_name}")
+        return None
+    
+    # Add treatment names
+    data_rows['Treatment_Name'] = data_rows['Treatment'].map(treatment_map)
+    data_rows['Assessment_Date'] = sheet_name
+    
+    return data_rows
 
-@dataclass
-class AovResult:
-    aov_table: pd.DataFrame
-    means: pd.DataFrame
-    ese: float
-    sed: float
-    lsd: float
-    alpha: float
-    df_resid: int
-    mse: float
-    grand_mean: float
-    cv_block_units: float
-    se_block_units: float
-    se_block: float | None
-    cv_block: float | None
-    p_treatment: float
-    letters: pd.DataFrame | None
-    warnings: list
+def calculate_fishers_lsd(data, parameter, alpha=0.05):
+    """Calculate Fisher's LSD and assign letter groups - FIXED algorithm"""
+    try:
+        treatments = sorted(data['Treatment'].unique())
+        n_treatments = len(treatments)
+        
+        # Get group data and means
+        means = {}
+        groups = {}
+        for t in treatments:
+            group = data[data['Treatment'] == t][parameter].values
+            means[t] = np.mean(group)
+            groups[t] = group
+        
+        # Check for variation
+        all_values = np.concatenate(list(groups.values()))
+        if len(np.unique(all_values)) == 1:
+            return None, {t: 'a' for t in treatments}
+        
+        # Calculate MSE (Mean Square Error)
+        ss_within = 0
+        for t in treatments:
+            group_mean = means[t]
+            ss_within += np.sum((groups[t] - group_mean) ** 2)
+        
+        df_within = len(data) - n_treatments
+        
+        if df_within <= 0 or ss_within == 0:
+            return None, {t: 'a' for t in treatments}
+        
+        mse = ss_within / df_within
+        
+        # n per treatment (assuming balanced design)
+        n_per_treatment = len(groups[treatments[0]])
+        
+        if n_per_treatment == 0 or mse == 0:
+            return None, {t: 'a' for t in treatments}
+        
+        # Calculate LSD
+        t_critical = stats.t.ppf(1 - alpha/2, df_within)
+        lsd = t_critical * np.sqrt(2 * mse / n_per_treatment)
+        
+        # PROPER letter grouping algorithm
+        # Sort treatments by mean (highest to lowest)
+        sorted_treatments = sorted(treatments, key=lambda t: means[t], reverse=True)
+        
+        # Create matrix of significant differences
+        sig_diff = {}
+        for i, t1 in enumerate(sorted_treatments):
+            sig_diff[t1] = set()
+            for j, t2 in enumerate(sorted_treatments):
+                if abs(means[t1] - means[t2]) > lsd:
+                    sig_diff[t1].add(t2)
+        
+        # Assign letters
+        letter_assignments = {}
+        available_letters = list('abcdefghijklmnopqrstuvwxyz')
+        letter_idx = 0
+        
+        for treatment in sorted_treatments:
+            # Find which letters this treatment can use
+            possible_letters = set()
+            
+            # Check all already-assigned treatments
+            for assigned_trt, assigned_letters in letter_assignments.items():
+                # If NOT significantly different, can share letters
+                if assigned_trt not in sig_diff[treatment]:
+                    possible_letters.update(assigned_letters)
+            
+            # If no compatible letters found, assign new letter
+            if not possible_letters:
+                possible_letters.add(available_letters[letter_idx])
+                letter_idx += 1
+            
+            letter_assignments[treatment] = possible_letters
+        
+        # Convert sets to sorted strings
+        final_groups = {}
+        for t, letters in letter_assignments.items():
+            final_groups[t] = ''.join(sorted(letters))
+        
+        return lsd, final_groups
+        
+    except Exception as e:
+        return None, {t: 'a' for t in data['Treatment'].unique()}
 
-def randomized_block_anova(df: pd.DataFrame, response: str, trt: str, block: str, alpha: float) -> AovResult:
-    warnings = []
-    d = df[[response, trt, block]].dropna().copy()
-    d[trt] = d[trt].astype("category")
-    d[block] = d[block].astype("category")
+def analyze_data(raw_data, treatment_map, parameters, alpha=0.05):
+    """Run statistical analysis"""
+    all_data = pd.concat(raw_data.values(), ignore_index=True)
+    assessment_dates = sorted(raw_data.keys())
+    
+    statistics = {}
+    
+    for parameter in parameters:
+        if parameter not in all_data.columns:
+            continue
+        
+        param_results = {
+            'dates': assessment_dates,
+            'treatments': sorted(treatment_map.keys()),
+            'treatment_names': [treatment_map[t] for t in sorted(treatment_map.keys())],
+            'means': {},
+            'letter_groups': {},
+            'statistics': {}
+        }
+        
+        for date in assessment_dates:
+            date_data = all_data[all_data['Assessment_Date'] == date].copy()
+            date_data = date_data[pd.notna(date_data[parameter])]
+            
+            if len(date_data) == 0:
+                continue
+            
+            # Calculate means
+            means = date_data.groupby('Treatment')[parameter].mean()
+            param_results['means'][date] = means.to_dict()
+            
+            # Run ANOVA
+            treatment_groups = [
+                date_data[date_data['Treatment'] == t][parameter].values 
+                for t in sorted(treatment_map.keys())
+                if t in date_data['Treatment'].values
+            ]
+            
+            treatment_groups = [g for g in treatment_groups if len(g) > 0]
+            
+            if len(treatment_groups) > 1:
+                try:
+                    # Check if there's any variation in the data
+                    all_values = np.concatenate(treatment_groups)
+                    if len(np.unique(all_values)) == 1:
+                        # All values are identical - no variation
+                        param_results['statistics'][date] = {
+                            'p_value': None,
+                            'f_stat': None,
+                            'lsd': None,
+                            'significant': False
+                        }
+                        param_results['letter_groups'][date] = {t: 'ns' for t in means.index}
+                        continue
+                    
+                    f_stat, p_value = stats.f_oneway(*treatment_groups)
+                    
+                    if p_value < alpha:
+                        lsd_value, letter_groups = calculate_fishers_lsd(date_data, parameter, alpha)
+                        param_results['statistics'][date] = {
+                            'p_value': p_value,
+                            'f_stat': f_stat,
+                            'lsd': lsd_value,
+                            'significant': True
+                        }
+                        param_results['letter_groups'][date] = letter_groups
+                    else:
+                        param_results['statistics'][date] = {
+                            'p_value': p_value,
+                            'f_stat': f_stat,
+                            'lsd': None,
+                            'significant': False
+                        }
+                        param_results['letter_groups'][date] = {t: 'ns' for t in means.index}
+                        
+                except Exception as e:
+                    st.warning(f"Error calculating statistics for {parameter} on {date}: {str(e)}")
+                    param_results['statistics'][date] = {
+                        'p_value': None,
+                        'f_stat': None,
+                        'lsd': None,
+                        'significant': False
+                    }
+                    param_results['letter_groups'][date] = {t: 'ns' for t in means.index}
+        
+        statistics[parameter] = param_results
+    
+    return statistics
 
-    model = smf.ols(f"Q('{response}') ~ C(Q('{trt}')) + C(Q('{block}'))", data=d).fit()
-    aov = anova_lm(model, typ=2)
+def create_excel_output(statistics):
+    """Create Excel file with statistics tables - matching GenStat format exactly"""
+    output = BytesIO()
+    sheets_written = 0
+    
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        
+        for parameter, stats in statistics.items():
+            try:
+                # Use dates in correct chronological order
+                dates_with_data = [d for d in stats.get('dates', []) 
+                                 if d in stats.get('means', {}) and len(stats['means'][d]) > 0]
+                
+                if not dates_with_data:
+                    continue
+                
+                treatments = stats.get('treatment_names', [])
+                if not treatments:
+                    continue
+                
+                # Get DAT labels for dates with data
+                try:
+                    dat_labels = [stats['dat_labels'][stats['dates'].index(d)] for d in dates_with_data]
+                except (KeyError, IndexError):
+                    # Fallback if dat_labels not available
+                    dat_labels = [''] * len(dates_with_data)
+                
+                # Create main table with means and letter groups
+                table_data = []
+                for i, trt_num in enumerate(stats['treatments']):
+                    row = [treatments[i]]
+                    for date in dates_with_data:
+                        if date in stats['means'] and trt_num in stats['means'][date]:
+                            mean = stats['means'][date][trt_num]
+                            
+                            # Add letter group if exists (and not empty)
+                            letter = ''
+                            if (date in stats.get('letter_groups', {}) and 
+                                trt_num in stats['letter_groups'][date]):
+                                letter = stats['letter_groups'][date][trt_num]
+                            
+                            if letter and letter != '':
+                                row.append(f"{mean:.1f} {letter}")
+                            else:
+                                row.append(f"{mean:.1f}")
+                        else:
+                            row.append('')
+                    table_data.append(row)
+                
+                if not table_data:
+                    continue
+                
+                # Create dataframe with date row
+                df = pd.DataFrame(table_data, columns=['Treatment'] + dates_with_data)
+                
+                # Insert DAT labels row at the top
+                dat_row = pd.DataFrame([[''] + dat_labels], columns=df.columns)
+                
+                # Add blank row, then statistical rows
+                blank_row = [''] * len(df.columns)
+                p_row = ['P']
+                lsd_row = ['LSD']
+                df_row = ['d.f.']
+                cv_row = ['%c.v.']
+                
+                for date in dates_with_data:
+                    stat = stats.get('statistics', {}).get(date, {})
+                    
+                    # P-value
+                    p = stat.get('p_value')
+                    if p is not None:
+                        if p < 0.001:
+                            p_row.append('<0.001')
+                        elif stat.get('significant', False):
+                            p_row.append(f"{p:.3f}")
+                        else:
+                            p_row.append('ns')
+                    else:
+                        p_row.append('ns')
+                    
+                    # LSD
+                    if stat.get('lsd'):
+                        lsd_val = stat['lsd']
+                        if lsd_val < 10:
+                            lsd_row.append(f"{lsd_val:.3f}")
+                        else:
+                            lsd_row.append(f"{lsd_val:.2f}")
+                    else:
+                        lsd_row.append('-')
+                    
+                    # d.f.
+                    if stat.get('df') is not None:
+                        df_row.append(str(int(stat['df'])))
+                    else:
+                        df_row.append('-')
+                    
+                    # %c.v.
+                    if stat.get('cv') is not None:
+                        cv_row.append(f"{stat['cv']:.1f}")
+                    else:
+                        cv_row.append('-')
+                
+                # Combine all rows
+                stat_df = pd.DataFrame([blank_row, p_row, lsd_row, df_row, cv_row], columns=df.columns)
+                final_df = pd.concat([dat_row, df, stat_df], ignore_index=True)
+                
+                # Write to Excel
+                final_df.to_excel(writer, sheet_name=parameter[:31], index=False, header=True)
+                sheets_written += 1
+                
+            except Exception as e:
+                # Skip this parameter but continue with others
+                continue
+    
+    # Check if we wrote any sheets BEFORE closing writer
+    if sheets_written == 0:
+        # Reopen and create dummy sheet
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            dummy_df = pd.DataFrame({'Message': ['No data available to export']})
+            dummy_df.to_excel(writer, sheet_name='Info', index=False)
+    
+    output.seek(0)
+    return output
 
-    df_resid = int(aov.loc["Residual", "df"])
-    mse = float(aov.loc["Residual", "sum_sq"] / aov.loc["Residual", "df"]) if df_resid > 0 else float("nan")
-    se_block_units = math.sqrt(mse) if mse == mse else float("nan")
-    grand_mean = float(d[response].mean())
-    cv_block_units = 100.0 * se_block_units / grand_mean if grand_mean != 0 and not np.isnan(se_block_units) else float("nan")
+# Sidebar
+st.sidebar.header("📋 Instructions")
+st.sidebar.markdown("""
+1. Upload your STRI assessment Excel file
+2. Click 'Analyze Data'
+3. Review results
+4. Download statistics tables
+5. Download HTML report
 
-    counts = d.groupby(trt)[response].count().to_dict()
-    unique_counts = set(counts.values())
-    if len(unique_counts) != 1:
-        warnings.append("Design appears unbalanced; e.s.e./s.e.d./LSD use harmonic reps.")
-        r = stats.hmean(np.array(list(counts.values()), dtype=float))
-    else:
-        r = float(unique_counts.pop())
-    ese = math.sqrt(mse / r) if r and r > 0 and not np.isnan(mse) else float("nan")
-    sed = math.sqrt(2 * mse / r) if r and r > 0 and not np.isnan(mse) else float("nan")
-    tcrit = stats.t.ppf(1 - alpha/2, df_resid) if df_resid > 0 else float("nan")
-    lsd = tcrit * sed if not any(np.isnan([tcrit, sed])) else float("nan")
+**File Requirements:**
+- Multiple date sheets (e.g., "03.07.25")
+- Trial Plan sheet with treatments
+- Standard STRI format
+""")
 
-    means = d.groupby(trt, observed=True)[response].mean().rename("Mean").to_frame()
-    means.index.name = "Treatment"
-    p_treatment = float(aov.loc[f"C(Q('{trt}'))", "PR(>F)"])
+# Main content
+col1, col2 = st.columns([2, 1])
 
-    letters_df = None
-    if p_treatment < alpha and not np.isnan(lsd):
-        letters_df = _fisher_lsd_letters(means["Mean"], lsd)
-    else:
-        warnings.append("Fisher’s protected LSD not calculated (Treatment not significant).")
-
-    aov_out = aov.rename(columns={"df": "d.f.", "sum_sq": "s.s.", "mean_sq": "m.s.", "F": "v.r.", "PR(>F)": "F pr."})
-    for c in ['d.f.', 's.s.', 'm.s.', 'v.r.', 'F pr.']:
-        if c not in aov_out.columns: aov_out[c] = np.nan
-    aov_out = aov_out[['d.f.', 's.s.', 'm.s.', 'v.r.', 'F pr.']]
-
-    return AovResult(
-        aov_table=aov_out, means=means, ese=ese, sed=sed, lsd=lsd, alpha=alpha,
-        df_resid=df_resid, mse=mse, grand_mean=grand_mean, cv_block_units=cv_block_units,
-        se_block_units=se_block_units, se_block=None, cv_block=None,
-        p_treatment=p_treatment, letters=letters_df, warnings=warnings
+with col1:
+    st.header("📤 Upload Assessment File")
+    uploaded_file = st.file_uploader(
+        "Choose your STRI assessment Excel file",
+        type=['xlsx', 'xls'],
+        help="Upload the Excel file containing multiple assessment date sheets"
     )
 
-def _fisher_lsd_letters(means: pd.Series, lsd: float) -> pd.DataFrame:
-    m = means.sort_values()  # ascending
-    names, values = list(m.index), m.values
-    letters = [""] * len(names)
-    assigned = [False] * len(names)
-    current_letter = ord("a")
-    for i in range(len(names)):
-        if assigned[i]: continue
-        group = [i]
-        for j in range(i+1, len(names)):
-            if abs(values[j] - values[i]) <= lsd:
-                group.append(j)
-        ch = chr(current_letter)
-        for idx in group:
-            letters[idx] += ch; assigned[idx] = True
-        current_letter += 1
-    out = pd.DataFrame({"Mean": m.values, "Letters": letters}, index=names)
-    out.index.name = "Treatment"
-    return out
+with col2:
+    st.header("⚙️ Settings")
+    project_name = st.text_input("Project Name", "trial_analysis")
+    alpha = st.slider("Significance Level (α)", 0.01, 0.15, 0.05, 0.01,
+                     help="P-value threshold for significance. Default is 0.05 (5%). Higher values are more lenient.")
 
-def _adjust_pvalues(pvals: np.ndarray, method: str) -> np.ndarray:
-    m = len(pvals)
-    if method == "none": return pvals
-    if method == "bonferroni": return np.minimum(1.0, pvals * m)
-    if method == "holm":
-        order = np.argsort(pvals); adj = np.empty_like(pvals)
-        for rank, idx in enumerate(order, 1): adj[idx] = (m - rank + 1) * pvals[idx]
-        adj_sorted = np.maximum.accumulate(adj[order][::-1])[::-1]; adj[order] = np.minimum(adj_sorted, 1.0); return adj
-    if method in ("fdr_bh", "bh"):
-        order = np.argsort(pvals); ranked = np.arange(1, m+1)
-        adj_vals = pvals[order] * m / ranked; adj_vals = np.minimum.accumulate(adj_vals[::-1])[::-1]
-        out = np.empty_like(pvals); out[order] = np.minimum(adj_vals, 1.0); return out
-    return pvals
-
-def _format_p(p: float, alpha: float) -> str:
-    if np.isnan(p): return ""
-    if p >= alpha: return "NS"
-    return "<0.001" if p < 0.001 else f"{p:.3f}"
-
-def _build_matrix_table(results: dict[str, AovResult]) -> pd.DataFrame:
-    first = next(iter(results.values()))
-    trt_index = list(first.means.index)
-    core = {}
-    for col, res in results.items():
-        m = res.means.reindex(trt_index)
-        s_vals = m["Mean"].round(1).astype(str)
-        if res.letters is not None:
-            letters = res.letters.reindex(trt_index)["Letters"].fillna("")
-            s_vals = s_vals + letters.apply(lambda x: (" " + x) if x else "")
-        core[col] = s_vals
-    table = pd.DataFrame(core, index=pd.Index(trt_index, name="Treatment"))
-    p_row  = pd.Series({c: _format_p(res.p_treatment, res.alpha) for c, res in results.items()}, name="P")
-    lsd_row= pd.Series({c: (f"{res.lsd:.3f}" if res.p_treatment < res.alpha and not np.isnan(res.lsd) else "-") for c, res in results.items()}, name="LSD")
-    df_row = pd.Series({c: str(res.df_resid) for c, res in results.items()}, name="d.f.")
-    cv_row = pd.Series({c: (f"{res.cv_block_units:.1f}" if not np.isnan(res.cv_block_units) else "") for c, res in results.items()}, name="%c.v.")
-    out = pd.concat([table, pd.DataFrame([p_row, lsd_row, df_row, cv_row])])
-    out.index = [f"[{i+1}] {idx}" if i < len(trt_index) else idx for i, idx in enumerate(out.index)]
-    return out
-
-def _build_export_workbook(results: dict[str, AovResult]) -> bytes:
-    with pd.ExcelWriter(io.BytesIO(), engine="xlsxwriter") as writer:
-        for rname, res in results.items():
-            res.aov_table.to_excel(writer, sheet_name=f"{rname}_ANOVA")
-            res.means.to_excel(writer, sheet_name=f"{rname}_Means")
-            pd.DataFrame({
-                "alpha":[res.alpha], "df_resid":[res.df_resid], "MSE":[res.mse],
-                "e.s.e.":[res.ese], "s.e.d.":[res.sed], "l.s.d.":[res.lsd],
-                "grand_mean":[res.grand_mean], "se_residual":[res.se_block_units],
-                "cv%_residual":[res.cv_block_units], "p_treatment":[res.p_treatment],
-            }).to_excel(writer, sheet_name=f"{rname}_SEs", index=False)
-            if res.letters is not None:
-                res.letters.to_excel(writer, sheet_name=f"{rname}_LSD_letters")
-        if len(results) > 1:
-            _build_matrix_table(results).to_excel(writer, sheet_name="Matrix")
-        writer.book.close()
-        return writer.path.getvalue()
-
-# ---------- File input ----------
-uploaded = st.file_uploader("Drag & drop Excel file (.xlsx/.xls)", type=["xlsx","xls"])
-
-if not uploaded:
-    st.info("Upload an Excel file to begin.")
-else:
-    if input_mode == "Single sheet (wide)":
-        raw = pd.read_excel(uploaded, sheet_name=None)
-        sheet = st.selectbox("Sheet", list(raw.keys()), index=0)
-        df = _clean_colnames(raw[sheet])
-        st.write(":clipboard: **Preview**"); st.dataframe(df.head(20), use_container_width=True)
-        plot_col, block_col, trt_col, numeric_cols = guess_key_columns(df)
-        c1,c2,c3 = st.columns(3)
-        with c1: plot_col = st.selectbox("Plot column", df.columns, index=list(df.columns).index(plot_col) if plot_col in df.columns else 0)
-        with c2: block_col = st.selectbox("Block column", df.columns, index=list(df.columns).index(block_col) if block_col in df.columns else 0)
-        with c3: trt_col  = st.selectbox("Treatment column", df.columns, index=list(df.columns).index(trt_col)  if trt_col  in df.columns else 0)
-        response_cols = st.multiselect("Response variables (one or more)", [c for c in df.columns if c not in {plot_col, block_col, trt_col}], default=numeric_cols)
-
-        if response_cols:
-            per_resp: dict[str, AovResult] = {}
-            for rcol in response_cols:
-                per_resp[rcol] = randomized_block_anova(df, rcol, trt_col, block_col, alpha=alpha)
-            if len(per_resp) > 1 and adj_method != "none":
-                labels, pvals = zip(*[(k, v.p_treatment) for k, v in per_resp.items()])
-                adj = _adjust_pvalues(np.array(pvals, float), method=adj_method)
-                st.subheader("Adjusted p-values across responses")
-                st.dataframe(pd.DataFrame({"Response":labels, "p (Treatment)":pvals, f"p_adj [{adj_method}]":adj}).style.format({"p (Treatment)":"{:.3g}", f"p_adj [{adj_method}]":"{:.3g}"}), use_container_width=True)
-            st.subheader("Matrix (treatments × selected responses)")
-            st.dataframe(_build_matrix_table(per_resp), use_container_width=True)
-            st.subheader("Export"); 
-            if st.button("Build Excel output (.xlsx)"):
-                st.download_button("Download Excel results", data=_build_export_workbook(per_resp), file_name="genstat_style_output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    else:  # Multi-sheet (each sheet = date)
-        xls = pd.ExcelFile(uploaded)
-        all_data = []
-        for sheet in xls.sheet_names:
+if uploaded_file is not None:
+    
+    with st.spinner("Loading file..."):
+        try:
+            # Read Excel file
+            xl_file = pd.ExcelFile(uploaded_file)
+            
+            # Parse Trial Plan
+            if 'Trial Plan' in xl_file.sheet_names:
+                trial_plan = pd.read_excel(uploaded_file, sheet_name='Trial Plan', header=None)
+                st.session_state.treatment_map = parse_trial_plan(trial_plan)
+            else:
+                st.error("No 'Trial Plan' sheet found!")
+                st.stop()
+            
+            # Parse assessment sheets
+            date_sheets = [s for s in xl_file.sheet_names 
+                          if s not in ['Trial Plan', 'Sheet1']]
+            
+            raw_data = {}
+            for sheet_name in date_sheets:
+                df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
+                parsed_data = parse_assessment_sheet(df, sheet_name, st.session_state.treatment_map)
+                if parsed_data is not None and len(parsed_data) > 0:
+                    raw_data[sheet_name] = parsed_data
+            
+            st.session_state.raw_data = raw_data
+            
+            if len(raw_data) == 0:
+                st.error("No assessment data could be loaded from any sheets!")
+                st.stop()
+                
+        except Exception as e:
+            st.error(f"Error loading file: {str(e)}")
+            st.exception(e)
+            st.stop()
+    
+    # Display file info
+    st.success("✓ File loaded successfully!")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Treatments", len(st.session_state.treatment_map))
+    with col2:
+        st.metric("Assessment Dates", len(st.session_state.raw_data))
+    with col3:
+        total_plots = sum(len(df) for df in st.session_state.raw_data.values())
+        st.metric("Total Observations", total_plots)
+    with col4:
+        st.metric("Replicates", 4)
+    
+    # Show treatments
+    with st.expander("📋 View Treatments"):
+        for num, name in sorted(st.session_state.treatment_map.items()):
+            st.write(f"**[{num}]** {name}")
+    
+    # Show assessment dates
+    with st.expander("📅 View Assessment Dates"):
+        st.write(", ".join(sorted(st.session_state.raw_data.keys())))
+    
+    st.markdown("---")
+    
+    # Analysis button
+    if st.button("📊 Analyze Data", type="primary", use_container_width=True):
+        with st.spinner("Running statistical analysis..."):
+            parameters = ['TQ', 'TC', '%LGC', '%DS', '%Scar', 'NDVI', 'Phyto']
+            st.session_state.statistics = analyze_data(
+                st.session_state.raw_data,
+                st.session_state.treatment_map,
+                parameters,
+                alpha
+            )
+            st.session_state.analysis_complete = True
+        
+        st.success("✓ Analysis complete!")
+        st.balloons()
+    
+    # Display results
+    if st.session_state.analysis_complete and st.session_state.statistics:
+        st.markdown("---")
+        st.header("📊 Results Summary")
+        
+        # Summary metrics
+        sig_count = 0
+        for param, stats in st.session_state.statistics.items():
+            for date, stat_info in stats['statistics'].items():
+                if stat_info.get('significant', False):
+                    sig_count += 1
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Parameters Analyzed", len(st.session_state.statistics))
+        with col2:
+            st.metric("Significant Results", sig_count)
+        
+        # Parameter results
+        for param, stats in st.session_state.statistics.items():
+            with st.expander(f"📈 {param} - Results"):
+                
+                # Find significant dates
+                sig_dates = [date for date, stat_info in stats['statistics'].items() 
+                           if stat_info.get('significant', False)]
+                
+                if sig_dates:
+                    st.success(f"✓ Significant treatment effects detected on {len(sig_dates)} dates")
+                    
+                    # Show results for first significant date
+                    date = sig_dates[0]
+                    st.subheader(f"Results for {date}")
+                    
+                    # Create results table
+                    results_data = []
+                    for i, trt_num in enumerate(stats['treatments']):
+                        if date in stats['means'] and trt_num in stats['means'][date]:
+                            mean = stats['means'][date][trt_num]
+                            letter = stats['letter_groups'][date].get(trt_num, '')
+                            results_data.append({
+                                'Treatment': stats['treatment_names'][i],
+                                'Mean': f"{mean:.2f}",
+                                'Group': letter
+                            })
+                    
+                    results_df = pd.DataFrame(results_data)
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # Show statistics
+                    st.write(f"**P-value:** {stats['statistics'][date]['p_value']:.4f}")
+                    st.write(f"**LSD:** {stats['statistics'][date]['lsd']:.4f}")
+                else:
+                    st.info("No significant treatment effects detected")
+        
+        st.markdown("---")
+        
+        # Download section
+        st.header("📥 Download Results")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Excel download
             try:
-                preview = pd.read_excel(xls, sheet_name=sheet, nrows=20)
-                header_row = None
-                for i, row in preview.iterrows():
-                    vals = [str(v).lower() for v in row.values if pd.notna(v)]
-                    if any("block" in v for v in vals) and any("treat" in v for v in vals):
-                        header_row = i; break
-                if header_row is None: continue
-                df = pd.read_excel(xls, sheet_name=sheet, skiprows=header_row)
-                df.columns = df.iloc[0]; df = df.drop(df.index[0]).dropna(axis=1, how="all")
-                df.columns = [str(c).strip() for c in df.columns]
-                col_map = {c: re.sub(r"\\W+","",c).lower() for c in df.columns}
-                block_col = next((o for o,n in col_map.items() if "block" in n), None)
-                plot_col  = next((o for o,n in col_map.items() if "plot"  in n), None)
-                treat_col = next((o for o,n in col_map.items() if "treat" in n or "trt" in n), None)
-                if not (block_col and treat_col): continue
-                treat_idx = df.columns.get_loc(treat_col)
-                assess_list = df.columns[treat_idx+1:].tolist()
-                id_vars = [block_col, treat_col] + ([plot_col] if plot_col else [])
-                dfl = df.melt(id_vars=id_vars, value_vars=assess_list, var_name="Assessment", value_name="Value")
-                dfl = dfl.rename(columns={block_col:"Block", treat_col:"Treatment"})
-                dfl["DateLabel"] = sheet
-                all_data.append(dfl)
-            except Exception:
-                continue
-        if not all_data:
-            st.error("No valid tables found in this file.")
-        else:
-            data = pd.concat(all_data, ignore_index=True)
-            assessments = sorted(data["Assessment"].dropna().unique(), key=lambda x: str(x))
-            assess_choice = st.selectbox("Assessment variable", assessments, index=0)
-            df_sub = data[data["Assessment"] == assess_choice].copy()
-            df_sub["Value"] = pd.to_numeric(df_sub["Value"], errors="coerce")
-            df_sub = df_sub.dropna(subset=["Value"])
-            dates = list(dict.fromkeys(df_sub["DateLabel"].tolist()))
+                excel_file = create_excel_output(st.session_state.statistics)
+                st.download_button(
+                    label="📊 Download Excel Statistics Tables",
+                    data=excel_file,
+                    file_name=f"{project_name}_statistics.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"Error generating Excel file: {str(e)}")
+                st.write("Debug info:")
+                st.write(f"Parameters with data: {list(st.session_state.statistics.keys())}")
+                for param, stats in st.session_state.statistics.items():
+                    dates = [d for d in stats['dates'] if d in stats.get('means', {})]
+                    st.write(f"  {param}: {len(dates)} dates with data")
+        
+        with col2:
+            # HTML report placeholder
+            st.info("HTML report generation available in full version")
 
-            results = {}
-            for date_label in dates:
-                d = df_sub[df_sub["DateLabel"] == date_label].copy()
-                d = d.rename(columns={"Value": assess_choice})
-                if not d.empty:
-                    results[date_label] = randomized_block_anova(d, assess_choice, "Treatment", "Block", alpha=alpha)
-            if results:
-                st.subheader("Treatment × date table (with letters + footer)")
-                st.dataframe(_build_matrix_table(results), use_container_width=True)
-                if adj_method != "none" and len(results) > 1:
-                    labels, pvals = zip(*[(k, v.p_treatment) for k, v in results.items()])
-                    adj = _adjust_pvalues(np.array(pvals, float), method=adj_method)
-                    st.caption("Adjusted p-values across dates:")
-                    st.dataframe(pd.DataFrame({"Date":labels, "p (Treatment)":pvals, f"p_adj [{adj_method}]":adj}).style.format({"p (Treatment)":"{:.3g}", f"p_adj [{adj_method}]":"{:.3g}"}), use_container_width=True)
-                st.subheader("Export")
-                if st.button("Build Excel output (.xlsx)"):
-                    st.download_button("Download Excel results", data=_build_export_workbook(results), file_name="genstat_style_output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    st.info("👆 Upload your STRI assessment file to begin")
+    
+    # Example section
+    with st.expander("📖 Example File Format"):
+        st.markdown("""
+        Your Excel file should contain:
+        
+        **Assessment Date Sheets** (e.g., "03.07.25"):
+        - Row 1-6: Metadata (Trial Code, Date, Area, etc.)
+        - Row 7: Headers (Block! | Plot! | Treat1! | TQ | TC | %LGC | %DS | %Scar | NDVI | Phyto)
+        - Row 8+: Data (36 plots)
+        
+        **Trial Plan Sheet**:
+        - Treatment mapping:
+          ```
+          [1] Untreated
+          [2] Ryder
+          [3] GM Liquid Effect Fe
+          ...
+          ```
+        """)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666; font-size: 12px;'>
+    STRI Trial Analysis Tool | Built with Streamlit | Statistical analysis using Python scipy
+</div>
+""", unsafe_allow_html=True)
